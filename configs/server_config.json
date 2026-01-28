@@ -1,0 +1,24 @@
+{
+  "api": {
+    "host": "0.0.0.0",
+    "port": 8080,
+    "model_name": "qwen2.5-32b-instruct"
+  },
+  "scheduler": {
+    "max_queue_size": 100,
+    "max_active_requests": 4
+  },
+  "model": {
+    "path": "/models/qwen2.5-32b-instruct",
+    "max_seq_len": 70000,
+    "tensor_parallel": true
+  },
+  "gpu": {
+    "device_ids": [0, 1]
+  },
+  "logging": {
+    "level": "info",
+    "output": "both",
+    "json_format": true
+  }
+}
