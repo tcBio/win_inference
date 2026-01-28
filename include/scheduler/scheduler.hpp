@@ -6,6 +6,7 @@
 #include "tokenizer/tokenizer.hpp"
 #include "core/sampler.hpp"
 #include "core/stop_checker.hpp"
+#include "gpu/gpu_router.hpp"
 #include "utils/result.hpp"
 
 #include <memory>
@@ -17,6 +18,10 @@
 #include <unordered_map>
 
 namespace qwen::scheduler {
+
+/// Memory constants for KV cache sizing
+/// Qwen2.5-32B: 64 layers, 8 KV heads, 128 head_dim, 2 (K+V), 2 bytes (fp16)
+constexpr size_t KV_BYTES_PER_TOKEN = 2ULL * 64 * 8 * 128 * 2;  // 256KB per token
 
 /// Scheduler configuration
 struct SchedulerConfig {
@@ -103,6 +108,12 @@ public:
     /// Check if scheduler is running
     [[nodiscard]] bool is_running() const;
 
+    /// Set the GPU router for multi-GPU scheduling
+    void set_gpu_router(std::shared_ptr<gpu::GPURouter> router);
+
+    /// Get memory estimate for a request in bytes
+    [[nodiscard]] static size_t estimate_kv_memory(size_t seq_len);
+
 private:
     /// Admission control: check if request can be admitted
     [[nodiscard]] Result<void> admit(RequestPtr request);
@@ -112,6 +123,12 @@ private:
 
     /// Run one decode step for a request
     [[nodiscard]] Result<bool> run_decode_step(RequestPtr request);
+
+    /// Emit a token via queue or callback
+    void emit_token(RequestPtr request, int32_t token_id, const std::string& text);
+
+    /// Check stop conditions and return whether to continue
+    [[nodiscard]] Result<bool> check_stop_and_continue(RequestPtr request);
 
     /// Main decode loop (runs in separate thread)
     void decode_loop();
@@ -132,6 +149,7 @@ private:
     std::shared_ptr<backend::IModelRuntime> runtime_;
     std::shared_ptr<kvcache::IKVCacheAllocator> kv_allocator_;
     std::shared_ptr<tokenizer::ITokenizer> tokenizer_;
+    std::shared_ptr<gpu::GPURouter> gpu_router_;  // Optional: for multi-GPU routing
 
     // Components
     std::unique_ptr<core::Sampler> sampler_;

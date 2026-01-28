@@ -8,17 +8,38 @@
 
 namespace qwen::kvcache {
 
-/// KV cache handle representing allocated memory
+/// Per-device KV cache allocation for tensor-parallel
+struct PerDeviceKVCache {
+    void* k_cache = nullptr;        // Key cache memory on this device
+    void* v_cache = nullptr;        // Value cache memory on this device
+    int32_t device_id = 0;          // GPU device ID
+    size_t bytes_allocated = 0;     // Bytes on this device
+};
+
+/// KV cache handle representing allocated memory (supports tensor-parallel)
 struct KVCacheHandle {
-    void* k_cache = nullptr;        // Key cache memory
-    void* v_cache = nullptr;        // Value cache memory
+    void* k_cache = nullptr;        // Key cache memory (single-GPU, or first device)
+    void* v_cache = nullptr;        // Value cache memory (single-GPU, or first device)
     size_t max_seq_len = 0;         // Maximum sequence length
     size_t current_len = 0;         // Current used length
-    int32_t device_id = 0;          // GPU device ID
+    int32_t device_id = 0;          // Primary GPU device ID
     uint64_t allocation_id = 0;     // Unique ID for tracking
 
-    [[nodiscard]] bool is_valid() const { return k_cache != nullptr && v_cache != nullptr; }
+    // Tensor-parallel support: per-device allocations
+    std::vector<PerDeviceKVCache> device_caches;  // Empty for single-GPU
+    bool is_tensor_parallel = false;
+
+    [[nodiscard]] bool is_valid() const {
+        if (is_tensor_parallel) {
+            return !device_caches.empty() &&
+                   device_caches[0].k_cache != nullptr;
+        }
+        return k_cache != nullptr && v_cache != nullptr;
+    }
     [[nodiscard]] size_t remaining() const { return max_seq_len - current_len; }
+    [[nodiscard]] size_t num_devices() const {
+        return is_tensor_parallel ? device_caches.size() : 1;
+    }
 };
 
 /// Memory statistics
@@ -42,15 +63,31 @@ struct KVAllocatorConfig {
     int32_t device_id = 0;
     bool pre_allocate = false;      // Pre-allocate pool at startup
 
-    /// Calculate bytes per token for KV cache
+    // Tensor-parallel configuration
+    std::vector<int32_t> device_ids = {};  // Empty = single GPU (device_id)
+    int32_t tensor_parallel_size = 1;      // 1 = no TP, 2+ = split across GPUs
+
+    /// Calculate bytes per token for KV cache (full, not split)
     [[nodiscard]] size_t bytes_per_token() const {
         // K and V caches: 2 * layers * kv_heads * head_dim * dtype
         return 2 * num_layers * num_kv_heads * head_dim * dtype_bytes;
     }
 
+    /// Calculate bytes per token per device (for tensor-parallel)
+    [[nodiscard]] size_t bytes_per_token_per_device() const {
+        // KV heads are split across devices
+        int32_t kv_heads_per_device = num_kv_heads / tensor_parallel_size;
+        return 2 * num_layers * kv_heads_per_device * head_dim * dtype_bytes;
+    }
+
     /// Calculate total bytes for a sequence length
     [[nodiscard]] size_t bytes_for_seq_len(size_t seq_len) const {
         return seq_len * bytes_per_token();
+    }
+
+    /// Calculate bytes per device for a sequence length (tensor-parallel)
+    [[nodiscard]] size_t bytes_for_seq_len_per_device(size_t seq_len) const {
+        return seq_len * bytes_per_token_per_device();
     }
 };
 
@@ -64,19 +101,33 @@ public:
     /// Initialize the allocator
     [[nodiscard]] virtual Result<void> initialize(const KVAllocatorConfig& config) = 0;
 
-    /// Allocate KV cache for a request
+    /// Allocate KV cache for a request (single-GPU)
     /// @param max_seq_len Maximum sequence length this cache will hold
     /// @return Handle to allocated cache, or error if OOM
     [[nodiscard]] virtual Result<KVCacheHandle> allocate(size_t max_seq_len) = 0;
 
+    /// Allocate KV cache for tensor-parallel (multi-GPU)
+    /// @param max_seq_len Maximum sequence length this cache will hold
+    /// @param device_ids Device IDs to allocate across
+    /// @return Handle with per-device allocations, or error if OOM
+    [[nodiscard]] virtual Result<KVCacheHandle> allocate_tensor_parallel(
+        size_t max_seq_len, const std::vector<int32_t>& device_ids) = 0;
+
     /// Free a previously allocated cache
     virtual void free(KVCacheHandle& handle) = 0;
 
-    /// Check if allocation of given size would succeed
+    /// Check if allocation of given size would succeed (single-GPU)
     [[nodiscard]] virtual bool can_allocate(size_t max_seq_len) const = 0;
+
+    /// Check if tensor-parallel allocation would succeed
+    [[nodiscard]] virtual bool can_allocate_tensor_parallel(
+        size_t max_seq_len, const std::vector<int32_t>& device_ids) const = 0;
 
     /// Get memory statistics
     [[nodiscard]] virtual MemoryStats stats() const = 0;
+
+    /// Get memory statistics for a specific device
+    [[nodiscard]] virtual MemoryStats stats(int32_t device_id) const = 0;
 
     /// Get configuration
     [[nodiscard]] virtual const KVAllocatorConfig& config() const = 0;

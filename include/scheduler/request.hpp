@@ -11,8 +11,81 @@
 #include <memory>
 #include <vector>
 #include <functional>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <optional>
 
 namespace qwen::scheduler {
+
+/// Thread-safe token queue for SSE streaming
+/// Producer: scheduler thread, Consumer: HTTP thread
+struct TokenEvent {
+    enum class Type { Token, Complete, Error };
+    Type type;
+    int32_t token_id = 0;
+    std::string text;
+    api::FinishReason finish_reason = api::FinishReason::None;
+    std::optional<Error> error;
+};
+
+class TokenQueue {
+public:
+    explicit TokenQueue(size_t max_size = 1024) : max_size_(max_size) {}
+
+    /// Push a token event (producer side)
+    bool push(TokenEvent event) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (closed_) return false;
+        if (events_.size() >= max_size_) return false;  // Backpressure
+        events_.push(std::move(event));
+        cv_.notify_one();
+        return true;
+    }
+
+    /// Pop a token event with timeout (consumer side)
+    /// Returns nullopt on timeout or if queue is closed and empty
+    std::optional<TokenEvent> pop(std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (!cv_.wait_for(lock, timeout, [this] {
+            return !events_.empty() || closed_;
+        })) {
+            return std::nullopt;  // Timeout
+        }
+        if (events_.empty()) {
+            return std::nullopt;  // Closed and empty
+        }
+        auto event = std::move(events_.front());
+        events_.pop();
+        return event;
+    }
+
+    /// Close the queue (no more pushes allowed)
+    void close() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        closed_ = true;
+        cv_.notify_all();
+    }
+
+    /// Check if closed
+    bool is_closed() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return closed_;
+    }
+
+    /// Check if empty
+    bool empty() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return events_.empty();
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    std::queue<TokenEvent> events_;
+    size_t max_size_;
+    bool closed_ = false;
+};
 
 /// Request state in the scheduler
 enum class RequestState {
@@ -103,17 +176,25 @@ struct Request {
     api::FinishReason finish_reason = api::FinishReason::None;
     std::optional<Error> error;
 
+    // Prefill output logits (for first token sampling)
+    std::vector<float> prefill_logits;
+    int32_t prefill_logits_vocab_size = 0;
+
     // Resources
     kvcache::KVCacheHandle kv_cache;
     int32_t gpu_id = -1;
+    std::vector<int32_t> assigned_devices;  // For tensor parallel
 
     // Timing
     RequestTiming timing;
 
-    // Callbacks (for streaming)
+    // Callbacks (for streaming) - DEPRECATED: use token_queue instead
     TokenCallback on_token;
     CompletionCallback on_complete;
     ErrorCallback on_error;
+
+    // Thread-safe streaming via queue (preferred)
+    std::shared_ptr<TokenQueue> token_queue;
 
     // Streaming state
     bool is_streaming = false;

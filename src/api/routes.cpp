@@ -1,6 +1,7 @@
 #include "api/routes.hpp"
 #include "utils/logger.hpp"
 #include "utils/metrics.hpp"
+#include "utils/cancellation.hpp"
 
 #include <chrono>
 #include <random>
@@ -139,11 +140,46 @@ void chat_completions(
 
     const auto& built_prompt = prompt_result.value();
 
-    // Create scheduler request
+    // Validate prompt length against model limits
+    const auto& validation_config = ctx.validator->config();
+    int32_t prompt_tokens = static_cast<int32_t>(built_prompt.token_ids.size());
+    int32_t max_tokens = api_request.max_tokens.value_or(validation_config.default_max_tokens);
+    int32_t total_required = prompt_tokens + max_tokens;
+
+    if (prompt_tokens > validation_config.max_context_length) {
+        log_warn("api", "prompt_too_long", {
+            {"prompt_tokens", prompt_tokens},
+            {"max_context", validation_config.max_context_length}
+        }, log_ctx);
+        send_error(res, 400, "invalid_request_error", "context_length_exceeded",
+            "Prompt contains " + std::to_string(prompt_tokens) +
+            " tokens which exceeds the maximum context length of " +
+            std::to_string(validation_config.max_context_length));
+        return;
+    }
+
+    if (total_required > validation_config.max_context_length) {
+        // Adjust max_tokens to fit within context limit
+        int32_t available_for_completion = validation_config.max_context_length - prompt_tokens;
+        if (available_for_completion < 1) {
+            send_error(res, 400, "invalid_request_error", "context_length_exceeded",
+                "Prompt uses all available context. No room for completion.");
+            return;
+        }
+        log_info("api", "max_tokens_adjusted", {
+            {"original", max_tokens},
+            {"adjusted", available_for_completion},
+            {"prompt_tokens", prompt_tokens}
+        }, log_ctx);
+        api_request.max_tokens = available_for_completion;
+    }
+
+    // Create scheduler request with cancellation token
     auto request = scheduler::make_request(api_request);
     request->trace_id = log_ctx.request_id;
     request->input_tokens = built_prompt.token_ids;
     request->formatted_prompt = built_prompt.formatted_text;
+    request->cancel_token = make_cancellation_token();
 
     if (api_request.stream) {
         // Streaming response
@@ -154,11 +190,28 @@ void chat_completions(
         std::string completion_id = log_ctx.request_id;
         std::string model_name = ctx.model_name;
 
-        // Set up streaming
+        // Create thread-safe token queue for scheduler -> HTTP thread communication
+        request->token_queue = std::make_shared<scheduler::TokenQueue>();
+        request->is_streaming = true;
+
+        // Set up streaming using chunked content provider
+        // The HTTP thread will poll the token queue and write to sink
         res.set_chunked_content_provider(
             "text/event-stream",
             [request, completion_id, model_name, &ctx](
                 size_t /*offset*/, httplib::DataSink& sink) {
+
+                // Helper to write and detect client disconnect
+                auto safe_write = [&sink, &request](const std::string& data) -> bool {
+                    if (!sink.write(data.data(), data.size())) {
+                        // Client disconnected - cancel the request
+                        if (request->cancel_token) {
+                            request->cancel_token->cancel();
+                        }
+                        return false;
+                    }
+                    return true;
+                };
 
                 // Send initial chunk with role
                 ChatCompletionChunk initial_chunk{
@@ -172,100 +225,144 @@ void chat_completions(
                 };
                 nlohmann::json j;
                 to_json(j, initial_chunk);
-                sink.write("data: " + j.dump() + "\n\n");
+                if (!safe_write("data: " + j.dump() + "\n\n")) {
+                    sink.done();
+                    return false;
+                }
 
-                // Set up callbacks
-                std::atomic<bool> done{false};
-                std::mutex mtx;
-                std::condition_variable cv;
-
-                request->on_token = [&](int32_t /*token_id*/, const std::string& text) {
-                    if (text.empty()) return;
-
-                    ChatCompletionChunk chunk{
-                        .id = completion_id,
-                        .created = current_timestamp(),
-                        .model = model_name,
-                        .choices = {{
-                            .index = 0,
-                            .delta = {.content = text}
-                        }}
-                    };
-                    nlohmann::json j;
-                    to_json(j, chunk);
-                    sink.write("data: " + j.dump() + "\n\n");
-                };
-
-                request->on_complete = [&](FinishReason reason) {
-                    ChatCompletionChunk chunk{
-                        .id = completion_id,
-                        .created = current_timestamp(),
-                        .model = model_name,
-                        .choices = {{
-                            .index = 0,
-                            .delta = {},
-                            .finish_reason = reason
-                        }}
-                    };
-                    nlohmann::json j;
-                    to_json(j, chunk);
-                    sink.write("data: " + j.dump() + "\n\n");
-                    sink.write("data: [DONE]\n\n");
-
-                    std::lock_guard<std::mutex> lock(mtx);
-                    done.store(true);
-                    cv.notify_one();
-                };
-
-                request->on_error = [&](const Error& /*error*/) {
-                    std::lock_guard<std::mutex> lock(mtx);
-                    done.store(true);
-                    cv.notify_one();
-                };
-
-                // Submit request
+                // Submit request to scheduler
                 auto submit_result = ctx.scheduler->submit(request);
                 if (submit_result.is_error()) {
                     sink.done();
                     return false;
                 }
 
-                // Wait for completion
-                std::unique_lock<std::mutex> lock(mtx);
-                cv.wait(lock, [&] { return done.load(); });
+                // Poll token queue from HTTP thread (thread-safe)
+                // All sink writes happen on this thread, avoiding race conditions
+                bool done = false;
+                bool client_disconnected = false;
+
+                while (!done && !client_disconnected) {
+                    auto event = request->token_queue->pop(std::chrono::milliseconds(100));
+                    if (!event) {
+                        // Timeout - check if request was cancelled or errored
+                        if (request->is_terminal()) {
+                            done = true;
+                        }
+                        continue;
+                    }
+
+                    switch (event->type) {
+                        case scheduler::TokenEvent::Type::Token: {
+                            if (event->text.empty()) break;
+
+                            ChatCompletionChunk chunk{
+                                .id = completion_id,
+                                .created = current_timestamp(),
+                                .model = model_name,
+                                .choices = {{
+                                    .index = 0,
+                                    .delta = {.content = event->text}
+                                }}
+                            };
+                            nlohmann::json token_json;
+                            to_json(token_json, chunk);
+                            if (!safe_write("data: " + token_json.dump() + "\n\n")) {
+                                client_disconnected = true;
+                            }
+                            break;
+                        }
+
+                        case scheduler::TokenEvent::Type::Complete: {
+                            ChatCompletionChunk chunk{
+                                .id = completion_id,
+                                .created = current_timestamp(),
+                                .model = model_name,
+                                .choices = {{
+                                    .index = 0,
+                                    .delta = {},
+                                    .finish_reason = event->finish_reason
+                                }}
+                            };
+                            nlohmann::json complete_json;
+                            to_json(complete_json, chunk);
+                            safe_write("data: " + complete_json.dump() + "\n\n");
+                            safe_write("data: [DONE]\n\n");
+                            done = true;
+                            break;
+                        }
+
+                        case scheduler::TokenEvent::Type::Error: {
+                            // Send error event and terminate
+                            safe_write("data: [DONE]\n\n");
+                            done = true;
+                            break;
+                        }
+                    }
+                }
+
+                // Log if client disconnected before completion
+                if (client_disconnected) {
+                    log_info("api", "client_disconnected", {
+                        {"request_id", request->id}
+                    });
+                }
 
                 sink.done();
-                return true;
+                return !client_disconnected;
             });
 
     } else {
-        // Non-streaming response
-        std::promise<void> done_promise;
-        auto done_future = done_promise.get_future();
+        // Non-streaming response - use TokenQueue for thread-safe completion signaling
+        request->token_queue = std::make_shared<scheduler::TokenQueue>();
+        request->is_streaming = false;
 
-        request->on_complete = [&done_promise](FinishReason /*reason*/) {
-            done_promise.set_value();
-        };
-
-        request->on_error = [&done_promise, &res](const Error& error) {
-            send_error(res, 500, error);
-            done_promise.set_value();
-        };
-
-        // Submit and wait
+        // Submit request
         auto submit_result = ctx.scheduler->submit(request);
         if (submit_result.is_error()) {
             send_error(res, 503, submit_result.error());
             return;
         }
 
-        done_future.wait();
+        // Wait for completion via token queue (thread-safe)
+        // The scheduler will push a Complete or Error event when done
+        bool got_result = false;
+        std::optional<Error> error_result;
 
-        if (request->error) {
-            return;  // Error already sent
+        while (!got_result) {
+            auto event = request->token_queue->pop(std::chrono::milliseconds(100));
+            if (!event) {
+                // Timeout - check if request was cancelled externally
+                if (request->is_terminal()) {
+                    got_result = true;
+                }
+                continue;
+            }
+
+            switch (event->type) {
+                case scheduler::TokenEvent::Type::Token:
+                    // Tokens are accumulated in request->output_text by scheduler
+                    break;
+
+                case scheduler::TokenEvent::Type::Complete:
+                    got_result = true;
+                    break;
+
+                case scheduler::TokenEvent::Type::Error:
+                    got_result = true;
+                    error_result = event->error;
+                    break;
+            }
         }
 
-        // Build response
+        // Handle error case
+        if (error_result || request->error) {
+            const auto& err = error_result ? *error_result : *request->error;
+            send_error(res, 500, err);
+            return;
+        }
+
+        // Build response on HTTP thread (thread-safe)
         ChatCompletionResponse response{
             .id = log_ctx.request_id,
             .created = current_timestamp(),

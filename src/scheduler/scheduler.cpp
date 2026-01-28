@@ -119,6 +119,14 @@ bool Scheduler::is_running() const {
     return running_.load();
 }
 
+void Scheduler::set_gpu_router(std::shared_ptr<gpu::GPURouter> router) {
+    gpu_router_ = std::move(router);
+}
+
+size_t Scheduler::estimate_kv_memory(size_t seq_len) {
+    return seq_len * KV_BYTES_PER_TOKEN;
+}
+
 Result<void> Scheduler::admit(RequestPtr request) {
     // Check queue size
     {
@@ -130,6 +138,16 @@ Result<void> Scheduler::admit(RequestPtr request) {
 
     // Estimate memory requirements
     size_t estimated_seq_len = request->input_tokens.size() + request->max_tokens;
+    size_t estimated_bytes = estimate_kv_memory(estimated_seq_len);
+
+    // Check GPU router budgets if available
+    if (gpu_router_) {
+        if (!gpu_router_->can_place(request, estimated_bytes)) {
+            return Error::resource_exhausted("Insufficient GPU memory for request");
+        }
+    }
+
+    // Also check KV allocator (may have different limits)
     if (!kv_allocator_->can_allocate(estimated_seq_len)) {
         return Error::resource_exhausted("Insufficient memory for request");
     }
@@ -143,14 +161,43 @@ Result<void> Scheduler::run_prefill(RequestPtr request) {
 
     gauge(metrics::REQUESTS_ACTIVE).increment();
 
-    // Allocate KV cache
+    // Calculate memory requirements
     size_t max_seq_len = request->input_tokens.size() + request->max_tokens;
-    auto alloc_result = kv_allocator_->allocate(max_seq_len);
+    size_t estimated_bytes = estimate_kv_memory(max_seq_len);
+
+    // Route request to GPU(s) if router available
+    gpu::RoutingDecision routing;
+    if (gpu_router_) {
+        routing = gpu_router_->route(request);
+        request->assigned_devices = routing.device_ids;
+
+        // Reserve memory in GPU budgets
+        gpu_router_->reserve(routing, estimated_bytes);
+    }
+
+    // Allocate KV cache (tensor-parallel if routing decision requires it)
+    Result<kvcache::KVCacheHandle> alloc_result;
+    if (gpu_router_ && routing.strategy == gpu::GPUStrategy::TensorParallel
+            && routing.device_ids.size() > 1) {
+        alloc_result = kv_allocator_->allocate_tensor_parallel(max_seq_len, routing.device_ids);
+    } else {
+        alloc_result = kv_allocator_->allocate(max_seq_len);
+    }
+
     if (alloc_result.is_error()) {
+        // Release GPU budget reservation on failure
+        if (gpu_router_) {
+            gpu_router_->unreserve(routing, estimated_bytes);
+        }
         gauge(metrics::REQUESTS_ACTIVE).decrement();
         return alloc_result.error();
     }
     request->kv_cache = std::move(alloc_result.value());
+
+    // Commit GPU budget (move from reserved to used)
+    if (gpu_router_) {
+        gpu_router_->commit(routing, estimated_bytes);
+    }
 
     // Run prefill
     backend::PrefillInput input{
@@ -166,6 +213,11 @@ Result<void> Scheduler::run_prefill(RequestPtr request) {
         return prefill_result.error();
     }
 
+    // Store prefill logits for first token sampling
+    const auto& output = prefill_result.value();
+    request->prefill_logits = output.logits.data;
+    request->prefill_logits_vocab_size = output.logits.vocab_size;
+
     request->kv_cache.current_len = request->input_tokens.size();
     request->timing.prefill_end = std::chrono::steady_clock::now();
 
@@ -175,7 +227,8 @@ Result<void> Scheduler::run_prefill(RequestPtr request) {
     log_debug("scheduler", "prefill_complete", {
         {"request_id", request->id},
         {"prefill_ms", request->timing.prefill_time_ms()},
-        {"prompt_tokens", request->input_tokens.size()}
+        {"prompt_tokens", request->input_tokens.size()},
+        {"assigned_devices", request->assigned_devices.size()}
     });
 
     return Result<void>::success();
@@ -186,17 +239,58 @@ Result<bool> Scheduler::run_decode_step(RequestPtr request) {
         return false;
     }
 
-    // Determine input token
+    backend::Logits logits_to_sample;
     int32_t input_token;
+
     if (request->output_tokens.empty()) {
-        // First decode step - use last prefill logits
-        // In real implementation, would sample from prefill output
-        input_token = tokenizer_->special_tokens().eos_token_id;  // Placeholder
-    } else {
-        input_token = request->output_tokens.back();
+        // First decode step - sample from prefill logits
+        if (request->prefill_logits.empty()) {
+            return Error::internal("No prefill logits available for first token");
+        }
+
+        logits_to_sample.data = std::move(request->prefill_logits);
+        logits_to_sample.vocab_size = request->prefill_logits_vocab_size;
+        request->prefill_logits.clear();  // Free memory
+
+        // Sample first token from prefill logits
+        core::SamplingParams params{
+            .temperature = request->temperature,
+            .top_p = request->top_p,
+            .seed = request->seed
+        };
+
+        auto sample_result = sampler_->sample(logits_to_sample, params, {});
+        if (sample_result.is_error()) {
+            return sample_result.error();
+        }
+
+        int32_t first_token = sample_result.value().token_id;
+        request->output_tokens.push_back(first_token);
+        request->kv_cache.current_len++;
+
+        // Record first token time
+        request->timing.first_token_at = std::chrono::steady_clock::now();
+        histogram(metrics::TIME_TO_FIRST_TOKEN).observe(
+            request->timing.time_to_first_token_ms() / 1000.0);
+
+        // Decode and emit first token
+        auto text_result = tokenizer_->decode_token(first_token);
+        std::string token_text = text_result.ok() ? text_result.value() : "";
+        request->output_text.reserve(request->max_tokens * 4);  // Pre-allocate
+        request->output_text += token_text;
+
+        // Stream via token queue (thread-safe) or callback
+        emit_token(request, first_token, token_text);
+
+        counter(metrics::TOKENS_GENERATED).increment();
+
+        // Check stop after first token
+        return check_stop_and_continue(request);
     }
 
-    // Run decode
+    // Subsequent decode steps
+    input_token = request->output_tokens.back();
+
     backend::DecodeInput input{
         .input_token = input_token,
         .kv_cache = &request->kv_cache,
@@ -225,26 +319,35 @@ Result<bool> Scheduler::run_decode_step(RequestPtr request) {
     request->output_tokens.push_back(new_token);
     request->kv_cache.current_len++;
 
-    // Record first token time
-    if (request->output_tokens.size() == 1) {
-        request->timing.first_token_at = std::chrono::steady_clock::now();
-        histogram(metrics::TIME_TO_FIRST_TOKEN).observe(
-            request->timing.time_to_first_token_ms() / 1000.0);
-    }
-
     // Decode token to text
     auto text_result = tokenizer_->decode_token(new_token);
     std::string token_text = text_result.ok() ? text_result.value() : "";
     request->output_text += token_text;
 
-    // Stream token if callback is set
-    if (request->on_token) {
-        request->on_token(new_token, token_text);
-    }
+    // Stream token
+    emit_token(request, new_token, token_text);
 
     counter(metrics::TOKENS_GENERATED).increment();
 
-    // Check stop conditions
+    return check_stop_and_continue(request);
+}
+
+void Scheduler::emit_token(RequestPtr request, int32_t token_id, const std::string& text) {
+    // Prefer thread-safe token queue for streaming
+    if (request->token_queue) {
+        request->token_queue->push(TokenEvent{
+            .type = TokenEvent::Type::Token,
+            .token_id = token_id,
+            .text = text
+        });
+    }
+    // Fall back to callback (deprecated, not thread-safe for SSE)
+    else if (request->on_token) {
+        request->on_token(token_id, text);
+    }
+}
+
+Result<bool> Scheduler::check_stop_and_continue(RequestPtr request) {
     core::StopConfig stop_config{
         .stop_sequences = request->stop_sequences,
         .max_tokens = request->max_tokens
@@ -344,7 +447,16 @@ void Scheduler::complete_request(RequestPtr request, api::FinishReason reason) {
     request->set_state(RequestState::Completed);
     request->timing.completed_at = std::chrono::steady_clock::now();
 
-    if (request->on_complete) {
+    // Emit completion via token queue (thread-safe)
+    if (request->token_queue) {
+        request->token_queue->push(TokenEvent{
+            .type = TokenEvent::Type::Complete,
+            .finish_reason = reason
+        });
+        request->token_queue->close();
+    }
+    // Fall back to callback
+    else if (request->on_complete) {
         request->on_complete(reason);
     }
 
@@ -377,7 +489,16 @@ void Scheduler::fail_request(RequestPtr request, Error error) {
     request->set_state(RequestState::Errored);
     request->timing.completed_at = std::chrono::steady_clock::now();
 
-    if (request->on_error) {
+    // Emit error via token queue (thread-safe)
+    if (request->token_queue) {
+        request->token_queue->push(TokenEvent{
+            .type = TokenEvent::Type::Error,
+            .error = error
+        });
+        request->token_queue->close();
+    }
+    // Fall back to callback
+    else if (request->on_error) {
         request->on_error(error);
     }
 
@@ -402,6 +523,13 @@ void Scheduler::fail_request(RequestPtr request, Error error) {
 
 void Scheduler::free_resources(RequestPtr request) {
     if (request->kv_cache.is_valid()) {
+        // Release GPU budget
+        if (gpu_router_ && !request->assigned_devices.empty()) {
+            size_t max_seq_len = request->input_tokens.size() + request->max_tokens;
+            size_t estimated_bytes = estimate_kv_memory(max_seq_len);
+            gpu_router_->free(request->assigned_devices, estimated_bytes);
+        }
+
         kv_allocator_->free(request->kv_cache);
     }
 }

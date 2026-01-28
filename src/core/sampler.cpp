@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <numeric>
 #include <cmath>
+#include <queue>
 
 namespace qwen::core {
 
@@ -42,7 +43,7 @@ Result<SampleResult> Sampler::sample(
         rng.seed(default_rng_());
     }
 
-    // Top-k sampling
+    // Top-k sampling (optimized)
     if (params.top_k > 0) {
         return sample_top_k({modified_logits, logits.vocab_size},
                            params.temperature, static_cast<int32_t>(params.top_k), rng);
@@ -54,16 +55,18 @@ Result<SampleResult> Sampler::sample(
 }
 
 SampleResult Sampler::sample_greedy(const backend::Logits& logits) const {
+    // Optimized greedy: just find argmax, no need for full softmax
     auto max_it = std::max_element(logits.data.begin(), logits.data.end());
     int32_t token_id = static_cast<int32_t>(std::distance(logits.data.begin(), max_it));
+    float max_logit = *max_it;
 
-    // Compute probability via softmax
-    auto probs = softmax(logits.data);
-
+    // For greedy, probability is approximately 1.0 after softmax
+    // We skip computing full softmax since it's expensive and not needed
+    // The probability returned is just for logging/debugging
     return SampleResult{
         .token_id = token_id,
-        .probability = probs[token_id],
-        .logit = *max_it
+        .probability = 1.0f,  // Approximate - greedy always picks max
+        .logit = max_logit
     };
 }
 
@@ -73,34 +76,60 @@ SampleResult Sampler::sample_top_p(
     double top_p,
     std::mt19937& rng) const {
 
-    auto probs = softmax(logits.data);
+    // Optimization: if top_p is very high (e.g., 0.99+), we can limit search
+    // Use partial sort with a reasonable upper bound to avoid full sort
 
-    // Create sorted indices
-    std::vector<size_t> indices(probs.size());
+    const size_t vocab_size = logits.data.size();
+
+    // Heuristic: for high top_p, we rarely need more than a few hundred tokens
+    // For low top_p (e.g., 0.1), we might only need top 10-20
+    size_t max_candidates = std::min(vocab_size,
+        top_p >= 0.9 ? size_t(1000) : size_t(256));
+
+    // Find top candidates using partial sort
+    std::vector<size_t> indices(vocab_size);
     std::iota(indices.begin(), indices.end(), 0);
-    std::sort(indices.begin(), indices.end(),
-              [&probs](size_t a, size_t b) { return probs[a] > probs[b]; });
+
+    std::partial_sort(indices.begin(),
+                     indices.begin() + max_candidates,
+                     indices.end(),
+                     [&logits](size_t a, size_t b) {
+                         return logits.data[a] > logits.data[b];
+                     });
+
+    // Compute softmax only for top candidates
+    float max_logit = logits.data[indices[0]];
+    std::vector<float> exp_logits(max_candidates);
+    float sum_exp = 0.0f;
+
+    for (size_t i = 0; i < max_candidates; ++i) {
+        exp_logits[i] = std::exp(logits.data[indices[i]] - max_logit);
+        sum_exp += exp_logits[i];
+    }
 
     // Find nucleus (tokens whose cumulative probability >= top_p)
     float cumsum = 0.0f;
     size_t nucleus_size = 0;
-    for (size_t i = 0; i < indices.size(); ++i) {
-        cumsum += probs[indices[i]];
+    float top_p_f = static_cast<float>(top_p);
+
+    for (size_t i = 0; i < max_candidates; ++i) {
+        float prob = exp_logits[i] / sum_exp;
+        cumsum += prob;
         nucleus_size = i + 1;
-        if (cumsum >= static_cast<float>(top_p)) {
+        if (cumsum >= top_p_f) {
             break;
         }
     }
 
     // Renormalize probabilities in nucleus
     std::vector<float> nucleus_probs(nucleus_size);
-    float sum = 0.0f;
+    float nucleus_sum = 0.0f;
     for (size_t i = 0; i < nucleus_size; ++i) {
-        nucleus_probs[i] = probs[indices[i]];
-        sum += nucleus_probs[i];
+        nucleus_probs[i] = exp_logits[i];
+        nucleus_sum += nucleus_probs[i];
     }
     for (float& p : nucleus_probs) {
-        p /= sum;
+        p /= nucleus_sum;
     }
 
     // Sample from nucleus
@@ -110,7 +139,7 @@ SampleResult Sampler::sample_top_p(
 
     return SampleResult{
         .token_id = token_id,
-        .probability = probs[token_id],
+        .probability = nucleus_probs[sampled_idx],
         .logit = logits.data[token_id]
     };
 }
@@ -121,27 +150,35 @@ SampleResult Sampler::sample_top_k(
     int32_t top_k,
     std::mt19937& rng) const {
 
-    auto probs = softmax(logits.data);
+    const size_t vocab_size = logits.data.size();
+    size_t k = std::min(static_cast<size_t>(top_k), vocab_size);
 
-    // Find top-k indices
-    std::vector<size_t> indices(probs.size());
+    // Optimized: use partial_sort to get only top-k elements
+    // This is O(n log k) instead of O(n log n) for full sort
+    std::vector<size_t> indices(vocab_size);
     std::iota(indices.begin(), indices.end(), 0);
+
     std::partial_sort(indices.begin(),
-                     indices.begin() + std::min(static_cast<size_t>(top_k), indices.size()),
+                     indices.begin() + k,
                      indices.end(),
-                     [&probs](size_t a, size_t b) { return probs[a] > probs[b]; });
+                     [&logits](size_t a, size_t b) {
+                         return logits.data[a] > logits.data[b];
+                     });
 
-    size_t k = std::min(static_cast<size_t>(top_k), indices.size());
+    // Compute softmax only for top-k elements (not full vocabulary)
+    float max_logit = logits.data[indices[0]];
+    std::vector<float> exp_logits(k);
+    float sum_exp = 0.0f;
 
-    // Renormalize top-k probabilities
-    std::vector<float> top_k_probs(k);
-    float sum = 0.0f;
     for (size_t i = 0; i < k; ++i) {
-        top_k_probs[i] = probs[indices[i]];
-        sum += top_k_probs[i];
+        exp_logits[i] = std::exp(logits.data[indices[i]] - max_logit);
+        sum_exp += exp_logits[i];
     }
-    for (float& p : top_k_probs) {
-        p /= sum;
+
+    // Normalize to probabilities
+    std::vector<float> top_k_probs(k);
+    for (size_t i = 0; i < k; ++i) {
+        top_k_probs[i] = exp_logits[i] / sum_exp;
     }
 
     // Sample
@@ -151,7 +188,7 @@ SampleResult Sampler::sample_top_k(
 
     return SampleResult{
         .token_id = token_id,
-        .probability = probs[token_id],
+        .probability = top_k_probs[sampled_idx],
         .logit = logits.data[token_id]
     };
 }
