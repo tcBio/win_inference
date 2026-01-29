@@ -13,6 +13,9 @@
 #include <fstream>
 #include <atomic>
 #include <iostream>
+#include <condition_variable>
+#include <mutex>
+#include <cstring>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -22,6 +25,16 @@
 
 namespace {
 std::atomic<bool> g_shutdown_requested{false};
+std::mutex g_shutdown_mutex;
+std::condition_variable g_shutdown_cv;
+
+void request_shutdown() {
+    {
+        std::lock_guard<std::mutex> lock(g_shutdown_mutex);
+        g_shutdown_requested.store(true);
+    }
+    g_shutdown_cv.notify_all();
+}
 
 #ifdef _WIN32
 // Windows console control handler
@@ -32,7 +45,7 @@ BOOL WINAPI console_handler(DWORD ctrl_type) {
         case CTRL_CLOSE_EVENT:
         case CTRL_LOGOFF_EVENT:
         case CTRL_SHUTDOWN_EVENT:
-            g_shutdown_requested.store(true);
+            request_shutdown();
             return TRUE;
         default:
             return FALSE;
@@ -42,7 +55,7 @@ BOOL WINAPI console_handler(DWORD ctrl_type) {
 // POSIX signal handler
 void signal_handler(int signal) {
     if (signal == SIGINT || signal == SIGTERM) {
-        g_shutdown_requested.store(true);
+        request_shutdown();
     }
 }
 #endif
@@ -69,7 +82,7 @@ struct ServerConfiguration {
 
 /// Validate configuration values
 /// Returns error message if invalid, empty string if valid
-std::string validate_config(const ServerConfiguration& config) {
+std::string validate_config(const ServerConfiguration& config, bool require_model_path = false) {
     // Validate port
     if (config.api.port <= 0 || config.api.port > 65535) {
         return "Invalid port: " + std::to_string(config.api.port) + " (must be 1-65535)";
@@ -90,11 +103,21 @@ std::string validate_config(const ServerConfiguration& config) {
     if (config.model.vocab_size <= 0) {
         return "vocab_size must be > 0";
     }
+    if (require_model_path && config.model.model_path.empty()) {
+        return "model.path is required";
+    }
 
     // Validate GPU settings
     for (int32_t device_id : config.gpu.device_ids) {
         if (device_id < 0) {
-            return "Invalid device_id: " + std::to_string(device_id);
+            return "Invalid gpu.device_id: " + std::to_string(device_id);
+        }
+    }
+
+    // Validate KV cache device_ids
+    for (int32_t device_id : config.kv_cache.device_ids) {
+        if (device_id < 0) {
+            return "Invalid kv_cache.device_id: " + std::to_string(device_id);
         }
     }
 
@@ -143,6 +166,7 @@ ServerConfiguration load_config(const std::string& config_path, bool& success) {
             auto& model = j["model"];
             config.model.model_path = model.value("path", config.model.model_path);
             config.model.max_seq_len = model.value("max_seq_len", config.model.max_seq_len);
+            config.model.vocab_size = model.value("vocab_size", config.model.vocab_size);
             config.model.tensor_parallel = model.value("tensor_parallel",
                 config.model.tensor_parallel);
         }
@@ -225,6 +249,10 @@ int main(int argc, char* argv[]) {
             print_version();
             return 0;
         } else if (arg[0] != '-') {
+            if (!config_path.empty()) {
+                std::cerr << "Warning: Multiple config files specified, using: "
+                          << arg << " (ignoring: " << config_path << ")" << std::endl;
+            }
             config_path = arg;
         } else {
             std::cerr << "Unknown option: " << arg << std::endl;
@@ -256,9 +284,21 @@ int main(int argc, char* argv[]) {
     const char* env_port = std::getenv("QWEN_PORT");
     if (env_port) {
         try {
-            config.api.port = std::stoi(env_port);
-        } catch (...) {
-            std::cerr << "Invalid QWEN_PORT value: " << env_port << std::endl;
+            size_t pos = 0;
+            int port = std::stoi(env_port, &pos);
+            if (pos != std::strlen(env_port)) {
+                std::cerr << "Invalid QWEN_PORT: '" << env_port
+                          << "' contains non-numeric characters" << std::endl;
+                return 1;
+            }
+            config.api.port = port;
+        } catch (const std::invalid_argument&) {
+            std::cerr << "Invalid QWEN_PORT: '" << env_port
+                      << "' is not a valid number" << std::endl;
+            return 1;
+        } catch (const std::out_of_range&) {
+            std::cerr << "Invalid QWEN_PORT: '" << env_port
+                      << "' is out of range" << std::endl;
             return 1;
         }
     }
@@ -272,6 +312,10 @@ int main(int argc, char* argv[]) {
 
     // Initialize logging first
     qwen::init_logger(config.logging);
+
+    // Initialize metrics collection
+    qwen::init_metrics();
+
     qwen::log_info("main", "starting", {
         {"version", "0.1.0"},
         {"config_file", config_path.empty() ? "(defaults)" : config_path}
@@ -401,9 +445,10 @@ int main(int argc, char* argv[]) {
                   << config.api.port << std::endl;
         std::cout << "Press Ctrl+C to shutdown" << std::endl;
 
-        // Wait for shutdown signal
-        while (!g_shutdown_requested.load()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        // Wait for shutdown signal using condition variable for immediate wake
+        {
+            std::unique_lock<std::mutex> lock(g_shutdown_mutex);
+            g_shutdown_cv.wait(lock, [] { return g_shutdown_requested.load(); });
         }
 
         qwen::log_info("main", "shutting_down", {});
