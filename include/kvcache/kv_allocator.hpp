@@ -136,8 +136,20 @@ public:
     virtual void reset() = 0;
 };
 
-/// Create a contiguous KV cache allocator (MVP)
+/// Create a contiguous KV cache allocator (MVP - per-request cudaMalloc)
 std::unique_ptr<IKVCacheAllocator> create_contiguous_allocator();
+
+/// Pooled allocator configuration
+struct PooledAllocatorConfig {
+    size_t slot_size_tokens = 16384;    // Max tokens per slot (16k default)
+    size_t num_slots = 8;                // Number of pre-allocated slots
+    bool allow_overflow = true;          // Allow cudaMalloc if pool exhausted
+};
+
+/// Create a pooled KV cache allocator (optimized - pre-allocated memory pool)
+/// Reduces allocation latency by avoiding per-request cudaMalloc
+std::unique_ptr<IKVCacheAllocator> create_pooled_allocator(
+    const PooledAllocatorConfig& pool_config = {});
 
 /// Memory math helpers for Qwen2.5-32B
 namespace qwen32b {
