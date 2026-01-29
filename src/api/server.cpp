@@ -35,6 +35,13 @@ Result<void> Server::start() {
     impl_->http_server.set_write_timeout(config_.write_timeout_sec, 0);
     impl_->http_server.set_payload_max_length(config_.max_request_size);
 
+    // Set worker thread count (cpp-httplib uses thread pool for concurrent requests)
+    if (config_.num_threads > 0) {
+        impl_->http_server.new_task_queue = [this] {
+            return new httplib::ThreadPool(config_.num_threads);
+        };
+    }
+
     // CORS headers
     if (config_.enable_cors) {
         impl_->http_server.set_default_headers({
@@ -85,7 +92,8 @@ Result<void> Server::start() {
     log_info("server", "started", {
         {"host", config_.host},
         {"port", config_.port},
-        {"model", config_.model_name}
+        {"model", config_.model_name},
+        {"num_threads", config_.num_threads}
     });
 
     return Result<void>::success();

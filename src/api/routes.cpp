@@ -43,12 +43,14 @@ void send_error(
     int status,
     const std::string& type,
     const std::string& code,
-    const std::string& message) {
+    const std::string& message,
+    const std::optional<std::string>& param) {
 
     ErrorResponse err{
         .type = type,
         .code = code,
-        .message = message
+        .message = message,
+        .param = param
     };
 
     nlohmann::json j;
@@ -58,8 +60,9 @@ void send_error(
     res.set_content(j.dump(), "application/json");
 }
 
-void send_error(httplib::Response& res, int status, const Error& error) {
-    send_error(res, status, "error", error.code, error.message);
+void send_error(httplib::Response& res, int status, const Error& error,
+    const std::optional<std::string>& param) {
+    send_error(res, status, "error", error.code, error.message, param);
 }
 
 void register_routes(httplib::Server& server, RouteContext& ctx) {
@@ -182,7 +185,8 @@ void chat_completions(
         send_error(res, 400, "invalid_request_error", "context_length_exceeded",
             "Prompt contains " + std::to_string(prompt_tokens) +
             " tokens which exceeds the maximum context length of " +
-            std::to_string(validation_config.max_context_length));
+            std::to_string(validation_config.max_context_length),
+            "messages");
         return;
     }
 
@@ -191,7 +195,8 @@ void chat_completions(
         int32_t available_for_completion = validation_config.max_context_length - prompt_tokens;
         if (available_for_completion < 1) {
             send_error(res, 400, "invalid_request_error", "context_length_exceeded",
-                "Prompt uses all available context. No room for completion.");
+                "Prompt uses all available context. No room for completion.",
+                "messages");
             return;
         }
         log_info("api", "max_tokens_adjusted", {

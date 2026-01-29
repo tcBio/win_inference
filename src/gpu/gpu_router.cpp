@@ -78,15 +78,21 @@ RoutingDecision GPURouter::route(const scheduler::RequestPtr& request) const {
     return decision;
 }
 
-bool GPURouter::can_place(const scheduler::RequestPtr& request, size_t estimated_bytes) const {
+bool GPURouter::can_place(const scheduler::RequestPtr& request,
+                          size_t total_bytes,
+                          size_t per_device_bytes) const {
     size_t context_length = request->input_tokens.size() + request->max_tokens;
     auto strategy = device_manager_->recommend_strategy(context_length);
 
     std::lock_guard<std::mutex> lock(budget_mutex_);
 
     if (strategy == GPUStrategy::TensorParallel) {
-        // For TP, need memory on all devices (split across devices)
-        size_t per_device = estimated_bytes / budgets_.size();
+        // For TP, need memory on all devices
+        // Use explicit per_device_bytes if provided (accounts for KV head split),
+        // otherwise fall back to simple division
+        size_t per_device = per_device_bytes > 0
+            ? per_device_bytes
+            : total_bytes / budgets_.size();
         for (const auto& budget : budgets_) {
             if (!budget.can_fit(per_device)) {
                 return false;
@@ -96,7 +102,7 @@ bool GPURouter::can_place(const scheduler::RequestPtr& request, size_t estimated
     } else {
         // For per-request, need at least one device with enough memory
         for (const auto& budget : budgets_) {
-            if (budget.can_fit(estimated_bytes)) {
+            if (budget.can_fit(total_bytes)) {
                 return true;
             }
         }

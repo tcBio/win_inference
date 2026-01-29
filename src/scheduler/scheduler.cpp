@@ -157,7 +157,9 @@ Result<void> Scheduler::admit(RequestPtr request) {
 
     // Check GPU router budgets if available
     if (gpu_router_) {
-        if (!gpu_router_->can_place(request, estimated_bytes)) {
+        // Calculate per-device bytes using KV allocator config for accurate TP sizing
+        size_t per_device_bytes = kv_allocator_->config().bytes_for_seq_len_per_device(estimated_seq_len);
+        if (!gpu_router_->can_place(request, estimated_bytes, per_device_bytes)) {
             return Error::resource_exhausted("Insufficient GPU memory for request");
         }
     }

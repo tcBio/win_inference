@@ -53,8 +53,11 @@ public:
 
     /// Check if a request can be placed given current memory
     /// @param request The request to check
-    /// @param estimated_bytes Estimated KV cache size in bytes
-    [[nodiscard]] bool can_place(const scheduler::RequestPtr& request, size_t estimated_bytes) const;
+    /// @param total_bytes Total estimated KV cache size in bytes
+    /// @param per_device_bytes Per-device bytes for TP (0 = auto-calculate as total/devices)
+    [[nodiscard]] bool can_place(const scheduler::RequestPtr& request,
+                                  size_t total_bytes,
+                                  size_t per_device_bytes = 0) const;
 
     /// Reserve memory for a request (call before allocation)
     /// @param decision The routing decision

@@ -61,9 +61,11 @@ void send_error(
     int status,
     const std::string& type,
     const std::string& code,
-    const std::string& message);
+    const std::string& message,
+    const std::optional<std::string>& param = std::nullopt);
 
-void send_error(httplib::Response& res, int status, const Error& error);
+void send_error(httplib::Response& res, int status, const Error& error,
+    const std::optional<std::string>& param = std::nullopt);
 
 /// Generate unique completion ID
 std::string generate_completion_id();
