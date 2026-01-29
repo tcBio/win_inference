@@ -1,5 +1,11 @@
 #include "tokenizer/tokenizer.hpp"
 
+#include <map>
+#include <limits>
+#include <vector>
+#include <string>
+#include <utility>
+
 // BPE implementation details
 // This file contains the byte-pair encoding algorithm implementation
 // For Qwen2.5, the tokenizer uses a tiktoken-style BPE

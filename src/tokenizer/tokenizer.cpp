@@ -6,6 +6,8 @@
 #include <sstream>
 #include <regex>
 #include <algorithm>
+#include <map>
+#include <unordered_set>
 
 namespace qwen::tokenizer {
 

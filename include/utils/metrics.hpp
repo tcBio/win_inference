@@ -61,12 +61,19 @@ private:
 /// Histogram for latency distributions
 class Histogram {
 public:
-    explicit Histogram(std::vector<double> bucket_bounds = {
-        0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0
-    }) : bounds_(std::move(bucket_bounds))
-       , buckets_(bounds_.size() + 1, 0)
-       , sum_(0)
-       , count_(0) {}
+    /// Default constructor with standard latency buckets
+    Histogram()
+        : bounds_({0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0})
+        , buckets_(bounds_.size() + 1, 0)
+        , sum_(0)
+        , count_(0) {}
+
+    /// Constructor with custom bucket bounds
+    explicit Histogram(std::vector<double> bucket_bounds)
+        : bounds_(std::move(bucket_bounds))
+        , buckets_(bounds_.size() + 1, 0)
+        , sum_(0)
+        , count_(0) {}
 
     void observe(double value) {
         std::lock_guard<std::mutex> lock(mutex_);

@@ -2,6 +2,7 @@
 
 #include "utils/result.hpp"
 #include "utils/cancellation.hpp"
+#include "kvcache/kv_allocator.hpp"
 
 #include <vector>
 #include <string>
@@ -10,9 +11,6 @@
 #include <functional>
 
 namespace qwen::backend {
-
-/// Forward declarations
-struct KVCacheHandle;
 
 /// Model configuration
 struct ModelConfig {
@@ -45,7 +43,7 @@ struct Logits {
 /// Prefill request input
 struct PrefillInput {
     TokenIds input_ids;
-    KVCacheHandle* kv_cache = nullptr;
+    kvcache::KVCacheHandle* kv_cache = nullptr;
     int32_t seq_len = 0;
 };
 
@@ -58,7 +56,7 @@ struct PrefillOutput {
 /// Decode step input
 struct DecodeInput {
     int32_t input_token;                // Single token for autoregressive
-    KVCacheHandle* kv_cache = nullptr;
+    kvcache::KVCacheHandle* kv_cache = nullptr;
     int32_t current_pos = 0;            // Current position in sequence
 };
 

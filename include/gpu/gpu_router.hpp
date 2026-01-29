@@ -20,10 +20,35 @@ struct RoutingDecision {
 
 /// Per-GPU memory budget tracking
 struct GPUBudget {
-    int32_t device_id;
-    size_t total_memory;        // Total available for KV cache
+    int32_t device_id = 0;
+    size_t total_memory = 0;        // Total available for KV cache
     std::atomic<size_t> used_memory{0};  // Currently allocated
     std::atomic<size_t> reserved_memory{0};  // Reserved for pending requests
+
+    // Default constructor
+    GPUBudget() = default;
+
+    // Move constructor (required for std::vector with non-copyable atomics)
+    GPUBudget(GPUBudget&& other) noexcept
+        : device_id(other.device_id)
+        , total_memory(other.total_memory)
+        , used_memory(other.used_memory.load(std::memory_order_relaxed))
+        , reserved_memory(other.reserved_memory.load(std::memory_order_relaxed)) {}
+
+    // Move assignment
+    GPUBudget& operator=(GPUBudget&& other) noexcept {
+        if (this != &other) {
+            device_id = other.device_id;
+            total_memory = other.total_memory;
+            used_memory.store(other.used_memory.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            reserved_memory.store(other.reserved_memory.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }
+        return *this;
+    }
+
+    // Delete copy operations (atomics are non-copyable)
+    GPUBudget(const GPUBudget&) = delete;
+    GPUBudget& operator=(const GPUBudget&) = delete;
 
     [[nodiscard]] size_t available() const {
         size_t used = used_memory.load(std::memory_order_acquire);
