@@ -17,6 +17,10 @@ struct RouteContext {
     std::shared_ptr<tokenizer::PromptBuilder> prompt_builder;
     RequestValidator* validator;
     std::string model_name;
+
+    // Timeout settings for HTTP layer (seconds, 0 = no timeout)
+    uint32_t stream_idle_timeout_sec = 30;   // Timeout if no token received
+    uint32_t response_timeout_sec = 300;      // Max time for non-streaming response
 };
 
 /// Register all API routes

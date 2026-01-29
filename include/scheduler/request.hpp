@@ -131,6 +131,11 @@ struct RequestTiming {
     std::chrono::steady_clock::time_point first_token_at;
     std::chrono::steady_clock::time_point completed_at;
 
+    // Timeout deadlines (time_point::max() means no timeout)
+    std::chrono::steady_clock::time_point queue_deadline;
+    std::chrono::steady_clock::time_point request_deadline;
+    std::chrono::steady_clock::time_point decode_deadline;
+
     [[nodiscard]] double queue_time_ms() const {
         return std::chrono::duration<double, std::milli>(prefill_start - queued_at).count();
     }
@@ -145,6 +150,21 @@ struct RequestTiming {
 
     [[nodiscard]] double total_time_ms() const {
         return std::chrono::duration<double, std::milli>(completed_at - received_at).count();
+    }
+
+    [[nodiscard]] bool is_queue_timed_out() const {
+        if (queue_deadline == std::chrono::steady_clock::time_point::max()) return false;
+        return std::chrono::steady_clock::now() > queue_deadline;
+    }
+
+    [[nodiscard]] bool is_request_timed_out() const {
+        if (request_deadline == std::chrono::steady_clock::time_point::max()) return false;
+        return std::chrono::steady_clock::now() > request_deadline;
+    }
+
+    [[nodiscard]] bool is_decode_timed_out() const {
+        if (decode_deadline == std::chrono::steady_clock::time_point::max()) return false;
+        return std::chrono::steady_clock::now() > decode_deadline;
     }
 };
 

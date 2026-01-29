@@ -32,6 +32,14 @@ struct Error {
     static Error resource_exhausted(const std::string& msg) {
         return Error{"resource_exhausted", msg};
     }
+
+    static Error timeout(const std::string& msg) {
+        return Error{"timeout", msg};
+    }
+
+    static Error cancelled(const std::string& msg) {
+        return Error{"cancelled", msg};
+    }
 };
 
 /// Result type for operations that can fail

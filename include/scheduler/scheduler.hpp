@@ -29,6 +29,11 @@ struct SchedulerConfig {
     size_t max_active_requests = 4;         // Max concurrent decoding requests
     uint32_t decode_loop_interval_us = 100; // Decode loop sleep when idle
     bool enable_continuous_batching = false; // V2 feature
+
+    // Timeout settings (0 = no timeout)
+    uint32_t queue_timeout_sec = 60;        // Max time waiting in queue
+    uint32_t request_timeout_sec = 300;     // Max total request time (5 min default)
+    uint32_t decode_timeout_sec = 0;        // Max decode phase time (0 = no limit)
 };
 
 /// Request registry for tracking all active requests

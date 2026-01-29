@@ -78,6 +78,21 @@ Result<void> Scheduler::submit(RequestPtr request) {
     request->set_state(RequestState::Queued);
     request->timing.queued_at = std::chrono::steady_clock::now();
 
+    // Set timeout deadlines
+    auto now = std::chrono::steady_clock::now();
+    if (config_.queue_timeout_sec > 0) {
+        request->timing.queue_deadline = now + std::chrono::seconds(config_.queue_timeout_sec);
+    } else {
+        request->timing.queue_deadline = std::chrono::steady_clock::time_point::max();
+    }
+    if (config_.request_timeout_sec > 0) {
+        request->timing.request_deadline = now + std::chrono::seconds(config_.request_timeout_sec);
+    } else {
+        request->timing.request_deadline = std::chrono::steady_clock::time_point::max();
+    }
+    // decode_deadline is set when prefill completes
+    request->timing.decode_deadline = std::chrono::steady_clock::time_point::max();
+
     // Add to queue
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
@@ -399,6 +414,18 @@ void Scheduler::decode_loop() {
                 continue;
             }
 
+            // Check for request timeout
+            if (request->timing.is_request_timed_out()) {
+                fail_request(request, Error::timeout("Request timed out"));
+                continue;
+            }
+
+            // Check for decode timeout
+            if (request->timing.is_decode_timed_out()) {
+                fail_request(request, Error::timeout("Decode phase timed out"));
+                continue;
+            }
+
             auto result = run_decode_step(request);
             if (result.is_error()) {
                 fail_request(request, result.error());
@@ -428,12 +455,33 @@ void Scheduler::process_queue() {
 
         queue_lock.unlock();
 
+        // Check for queue timeout
+        if (request->timing.is_queue_timed_out()) {
+            fail_request(request, Error::timeout("Request timed out waiting in queue"));
+            queue_lock.lock();
+            continue;
+        }
+
+        // Check for overall request timeout
+        if (request->timing.is_request_timed_out()) {
+            fail_request(request, Error::timeout("Request timed out"));
+            queue_lock.lock();
+            continue;
+        }
+
         // Run prefill
         auto prefill_result = run_prefill(request);
         if (prefill_result.is_error()) {
             fail_request(request, prefill_result.error());
         } else {
             request->set_state(RequestState::Decoding);
+
+            // Set decode deadline if configured
+            if (config_.decode_timeout_sec > 0) {
+                request->timing.decode_deadline =
+                    std::chrono::steady_clock::now() + std::chrono::seconds(config_.decode_timeout_sec);
+            }
+
             std::lock_guard<std::mutex> active_lock(active_mutex_);
             active_requests_.push_back(request);
         }

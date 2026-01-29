@@ -10,6 +10,18 @@
 
 namespace qwen::api {
 
+namespace {
+
+/// Add CORS headers to response
+void add_cors_headers(httplib::Response& res) {
+    res.set_header("Access-Control-Allow-Origin", "*");
+    res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    res.set_header("Access-Control-Max-Age", "86400");  // 24 hours
+}
+
+}  // namespace
+
 std::string generate_completion_id() {
     static std::random_device rd;
     static std::mt19937 gen(rd());
@@ -54,27 +66,43 @@ void register_routes(httplib::Server& server, RouteContext& ctx) {
     // Store context in a shared_ptr for lambda capture
     auto ctx_ptr = std::make_shared<RouteContext>(ctx);
 
+    // CORS preflight handlers
+    server.Options("/v1/chat/completions",
+        [](const httplib::Request& /*req*/, httplib::Response& res) {
+            add_cors_headers(res);
+            res.status = 204;
+        });
+    server.Options("/v1/models",
+        [](const httplib::Request& /*req*/, httplib::Response& res) {
+            add_cors_headers(res);
+            res.status = 204;
+        });
+
     // POST /v1/chat/completions
     server.Post("/v1/chat/completions",
         [ctx_ptr](const httplib::Request& req, httplib::Response& res) {
+            add_cors_headers(res);
             handlers::chat_completions(req, res, *ctx_ptr);
         });
 
     // GET /v1/models
     server.Get("/v1/models",
         [ctx_ptr](const httplib::Request& req, httplib::Response& res) {
+            add_cors_headers(res);
             handlers::list_models(req, res, *ctx_ptr);
         });
 
     // GET /health
     server.Get("/health",
         [ctx_ptr](const httplib::Request& req, httplib::Response& res) {
+            add_cors_headers(res);
             handlers::health_check(req, res, *ctx_ptr);
         });
 
     // GET /metrics
     server.Get("/metrics",
         [ctx_ptr](const httplib::Request& req, httplib::Response& res) {
+            add_cors_headers(res);
             handlers::metrics(req, res, *ctx_ptr);
         });
 
@@ -241,6 +269,8 @@ void chat_completions(
                 // All sink writes happen on this thread, avoiding race conditions
                 bool done = false;
                 bool client_disconnected = false;
+                auto last_token_time = std::chrono::steady_clock::now();
+                const auto idle_timeout = std::chrono::seconds(ctx.stream_idle_timeout_sec);
 
                 while (!done && !client_disconnected) {
                     auto event = request->token_queue->pop(std::chrono::milliseconds(100));
@@ -248,9 +278,29 @@ void chat_completions(
                         // Timeout - check if request was cancelled or errored
                         if (request->is_terminal()) {
                             done = true;
+                            continue;
+                        }
+
+                        // Check for idle timeout (no tokens received)
+                        if (ctx.stream_idle_timeout_sec > 0) {
+                            auto idle_duration = std::chrono::steady_clock::now() - last_token_time;
+                            if (idle_duration > idle_timeout) {
+                                log_warn("api", "stream_idle_timeout", {
+                                    {"request_id", request->id},
+                                    {"idle_sec", std::chrono::duration_cast<std::chrono::seconds>(idle_duration).count()}
+                                });
+                                // Cancel the request due to timeout
+                                if (request->cancel_token) {
+                                    request->cancel_token->cancel();
+                                }
+                                done = true;
+                            }
                         }
                         continue;
                     }
+
+                    // Reset idle timer on receiving an event
+                    last_token_time = std::chrono::steady_clock::now();
 
                     switch (event->type) {
                         case scheduler::TokenEvent::Type::Token: {
@@ -328,6 +378,8 @@ void chat_completions(
         // The scheduler will push a Complete or Error event when done
         bool got_result = false;
         std::optional<Error> error_result;
+        auto start_time = std::chrono::steady_clock::now();
+        const auto response_timeout = std::chrono::seconds(ctx.response_timeout_sec);
 
         while (!got_result) {
             auto event = request->token_queue->pop(std::chrono::milliseconds(100));
@@ -335,6 +387,24 @@ void chat_completions(
                 // Timeout - check if request was cancelled externally
                 if (request->is_terminal()) {
                     got_result = true;
+                    continue;
+                }
+
+                // Check for response timeout
+                if (ctx.response_timeout_sec > 0) {
+                    auto elapsed = std::chrono::steady_clock::now() - start_time;
+                    if (elapsed > response_timeout) {
+                        log_warn("api", "response_timeout", {
+                            {"request_id", request->id},
+                            {"elapsed_sec", std::chrono::duration_cast<std::chrono::seconds>(elapsed).count()}
+                        });
+                        // Cancel the request due to timeout
+                        if (request->cancel_token) {
+                            request->cancel_token->cancel();
+                        }
+                        error_result = Error::timeout("Request timed out");
+                        got_result = true;
+                    }
                 }
                 continue;
             }
@@ -358,7 +428,13 @@ void chat_completions(
         // Handle error case
         if (error_result || request->error) {
             const auto& err = error_result ? *error_result : *request->error;
-            send_error(res, 500, err);
+            int status = 500;
+            if (err.code == "timeout") {
+                status = 504;  // Gateway Timeout
+            } else if (err.code == "resource_exhausted") {
+                status = 503;  // Service Unavailable
+            }
+            send_error(res, status, err);
             return;
         }
 
