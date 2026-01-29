@@ -180,6 +180,9 @@ namespace metrics {
     // Throughput
     constexpr const char* TOKENS_GENERATED = "inference_tokens_generated_total";
     constexpr const char* TOKENS_PER_SECOND = "inference_tokens_per_second";
+
+    // Errors/warnings
+    constexpr const char* TOKENS_DROPPED = "inference_tokens_dropped_total";
 }
 
 }  // namespace qwen

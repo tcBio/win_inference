@@ -76,6 +76,8 @@ struct ServerConfiguration {
     qwen::scheduler::SchedulerConfig scheduler;
     qwen::backend::ModelConfig model;
     qwen::kvcache::KVAllocatorConfig kv_cache;
+    qwen::kvcache::PooledAllocatorConfig kv_pool;  // Pooled allocator settings
+    bool use_pooled_allocator = true;  // Use pooled allocator by default (less fragmentation)
     qwen::gpu::DeviceManagerConfig gpu;
     qwen::LoggerConfig logging;
 };
@@ -187,6 +189,17 @@ ServerConfiguration load_config(const std::string& config_path, bool& success) {
             if (kv.contains("device_ids")) {
                 config.kv_cache.device_ids = kv["device_ids"].get<std::vector<int32_t>>();
             }
+            // Allocator type: "pooled" (default) or "contiguous"
+            std::string allocator_type = kv.value("allocator", "pooled");
+            config.use_pooled_allocator = (allocator_type == "pooled");
+
+            // Pooled allocator settings
+            config.kv_pool.slot_size_tokens = kv.value("pool_slot_size_tokens",
+                config.kv_pool.slot_size_tokens);
+            config.kv_pool.num_slots = kv.value("pool_num_slots",
+                config.kv_pool.num_slots);
+            config.kv_pool.allow_overflow = kv.value("pool_allow_overflow",
+                config.kv_pool.allow_overflow);
         }
 
         // Parse logging config
@@ -363,7 +376,20 @@ int main(int argc, char* argv[]) {
                 config.kv_cache.device_ids.push_back(device.device_id);
             }
         }
-        auto kv_allocator = qwen::kvcache::create_contiguous_allocator();
+        // Create KV cache allocator (pooled by default for better performance)
+        std::unique_ptr<qwen::kvcache::IKVCacheAllocator> kv_allocator;
+        if (config.use_pooled_allocator) {
+            kv_allocator = qwen::kvcache::create_pooled_allocator(config.kv_pool);
+            qwen::log_info("main", "using_pooled_allocator", {
+                {"slot_size_tokens", config.kv_pool.slot_size_tokens},
+                {"num_slots", config.kv_pool.num_slots},
+                {"allow_overflow", config.kv_pool.allow_overflow}
+            });
+        } else {
+            kv_allocator = qwen::kvcache::create_contiguous_allocator();
+            qwen::log_info("main", "using_contiguous_allocator", {});
+        }
+
         auto kv_result = kv_allocator->initialize(config.kv_cache);
         if (kv_result.is_error()) {
             qwen::log_error("main", "kv_cache_init_failed", {
@@ -374,7 +400,8 @@ int main(int argc, char* argv[]) {
 
         qwen::log_info("main", "kv_cache_initialized", {
             {"total_bytes", kv_allocator->stats().total_bytes},
-            {"num_devices", config.kv_cache.device_ids.size()}
+            {"num_devices", config.kv_cache.device_ids.size()},
+            {"allocator_type", config.use_pooled_allocator ? "pooled" : "contiguous"}
         });
 
         // Initialize GPU router for multi-GPU scheduling

@@ -34,13 +34,24 @@ public:
     explicit TokenQueue(size_t max_size = 1024) : max_size_(max_size) {}
 
     /// Push a token event (producer side)
+    /// Returns true if pushed, false if dropped due to backpressure or closed
     bool push(TokenEvent event) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (closed_) return false;
-        if (events_.size() >= max_size_) return false;  // Backpressure
+        if (events_.size() >= max_size_) {
+            // Queue full - drop token and track it
+            dropped_count_++;
+            return false;
+        }
         events_.push(std::move(event));
         cv_.notify_one();
         return true;
+    }
+
+    /// Get count of dropped events due to backpressure
+    size_t dropped_count() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return dropped_count_;
     }
 
     /// Pop a token event with timeout (consumer side)
@@ -85,6 +96,7 @@ private:
     std::queue<TokenEvent> events_;
     size_t max_size_;
     bool closed_ = false;
+    size_t dropped_count_ = 0;
 };
 
 /// Request state in the scheduler

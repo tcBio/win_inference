@@ -293,6 +293,16 @@ void chat_completions(
                                 if (request->cancel_token) {
                                     request->cancel_token->cancel();
                                 }
+                                // Send error event before closing stream (OpenAI-compatible)
+                                nlohmann::json error_event = {
+                                    {"error", {
+                                        {"message", "Stream idle timeout - no tokens received"},
+                                        {"type", "timeout"},
+                                        {"code", "stream_idle_timeout"}
+                                    }}
+                                };
+                                safe_write("data: " + error_event.dump() + "\n\n");
+                                safe_write("data: [DONE]\n\n");
                                 done = true;
                             }
                         }
@@ -343,7 +353,21 @@ void chat_completions(
                         }
 
                         case scheduler::TokenEvent::Type::Error: {
-                            // Send error event and terminate
+                            // Send error event before terminating (OpenAI-compatible)
+                            std::string error_msg = "Internal error";
+                            std::string error_code = "internal_error";
+                            if (event->error) {
+                                error_msg = event->error->message;
+                                error_code = event->error->code;
+                            }
+                            nlohmann::json error_event = {
+                                {"error", {
+                                    {"message", error_msg},
+                                    {"type", "error"},
+                                    {"code", error_code}
+                                }}
+                            };
+                            safe_write("data: " + error_event.dump() + "\n\n");
                             safe_write("data: [DONE]\n\n");
                             done = true;
                             break;

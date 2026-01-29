@@ -350,11 +350,22 @@ Result<bool> Scheduler::run_decode_step(RequestPtr request) {
 void Scheduler::emit_token(RequestPtr request, int32_t token_id, const std::string& text) {
     // Prefer thread-safe token queue for streaming
     if (request->token_queue) {
-        request->token_queue->push(TokenEvent{
+        bool pushed = request->token_queue->push(TokenEvent{
             .type = TokenEvent::Type::Token,
             .token_id = token_id,
             .text = text
         });
+        if (!pushed) {
+            // Token dropped due to backpressure - log warning (once per request)
+            size_t dropped = request->token_queue->dropped_count();
+            if (dropped == 1) {
+                log_warn("scheduler", "token_queue_backpressure", {
+                    {"request_id", request->id},
+                    {"queue_full", true}
+                });
+            }
+            counter(metrics::TOKENS_DROPPED).increment();
+        }
     }
     // Fall back to callback (deprecated, not thread-safe for SSE)
     else if (request->on_token) {
@@ -517,6 +528,9 @@ void Scheduler::complete_request(RequestPtr request, api::FinishReason reason) {
             active_requests_.end());
     }
 
+    // Remove from registry to prevent memory leak
+    registry_.remove(request->id);
+
     gauge(metrics::REQUESTS_ACTIVE).decrement();
     completed_count_.fetch_add(1);
 
@@ -558,6 +572,9 @@ void Scheduler::fail_request(RequestPtr request, Error error) {
             std::remove(active_requests_.begin(), active_requests_.end(), request),
             active_requests_.end());
     }
+
+    // Remove from registry to prevent memory leak
+    registry_.remove(request->id);
 
     gauge(metrics::REQUESTS_ACTIVE).decrement();
     errored_count_.fetch_add(1);
